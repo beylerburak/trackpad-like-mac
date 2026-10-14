@@ -1,0 +1,261 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Per-user setup for trackpad-like-mac.
+
+  trackpad-like-mac setup    turn on the gestures, Mac-like touchpad settings
+                             and scrolling for the current user
+  trackpad-like-mac reset    turn them off and restore the previous settings
+  trackpad-like-mac status   show what is active
+  trackpad-like-mac uninstall  reset, then remove trackpad-like-mac entirely
+
+`setup --login` runs from autostart at every GNOME login. It sets a user up
+once, so later changes made in GNOME Settings stick, and keeps the scrolling
+calibrated to the current screen scale. After `reset` it does nothing.
+"""
+
+import argparse
+import ast
+import glob
+import os
+import pathlib
+import subprocess
+import sys
+
+LIBDIR = "@LIBDIR@"
+UUID = "trackpad-like-mac@beylerburak.github.io"
+SERVICE = "trackpad-like-mac.service"
+SOCKET = "/run/trackpad-like-mac/gestures.sock"
+TOUCHPAD = "org.gnome.desktop.peripherals.touchpad"
+SHELL = "org.gnome.shell"
+
+# Touchpad settings closest to a MacBook, as gsettings values.
+TOUCHPAD_SETTINGS = {
+    "tap-to-click": "true",
+    "tap-and-drag": "false",   # dragging is done with three fingers instead
+    "natural-scroll": "true",
+    "click-method": "'fingers'",  # two-finger click = right click
+    "disable-while-typing": "true",
+    "speed": "0.25",           # GNOME only offers speed; a bit faster is closer
+}
+# Scrolling: content millimetres per finger millimetre when slow and fast.
+SLOW_RATIO = 1.0
+FAST_RATIO = 2.5
+
+
+def config_dir():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return pathlib.Path(base, "trackpad-like-mac")
+
+
+class Gsettings:
+    def get(self, schema, key):
+        return subprocess.run(["gsettings", "get", schema, key], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def set(self, schema, key, value):
+        subprocess.run(["gsettings", "set", schema, key, value], check=True)
+
+
+def parse_strv(value):
+    """Parses a gsettings string list such as "['a', 'b']" or "@as []"."""
+    return list(ast.literal_eval(value.removeprefix("@as ")))
+
+
+class User:
+    """One user's trackpad-like-mac state."""
+
+    def __init__(self, gsettings=None, directory=None):
+        self.gsettings = gsettings or Gsettings()
+        self.dir = directory or config_dir()
+        self.state_file = self.dir / "state"
+        self.previous_file = self.dir / "previous-touchpad-settings"
+        self.scroll_file = self.dir / "scroll.conf"
+
+    @property
+    def state(self):
+        try:
+            return self.state_file.read_text().strip()
+        except FileNotFoundError:
+            return None
+
+    def setup(self, at_login=False):
+        if at_login and self.state == "reset":
+            return
+        if not (at_login and self.state == "active"):
+            self.dir.mkdir(parents=True, exist_ok=True)
+            self.enable_extension(True)
+            self.apply_touchpad_settings()
+            self.state_file.write_text("active\n")
+        self.calibrate_scrolling()
+
+    def reset(self):
+        self.enable_extension(False)
+        self.restore_touchpad_settings()
+        self.scroll_file.unlink(missing_ok=True)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.state_file.write_text("reset\n")
+
+    def enable_extension(self, enable):
+        enabled = parse_strv(self.gsettings.get(SHELL, "enabled-extensions"))
+        wanted = [e for e in enabled if e != UUID] + ([UUID] if enable else [])
+        if wanted != enabled:
+            self.gsettings.set(SHELL, "enabled-extensions", repr(wanted))
+
+    def apply_touchpad_settings(self):
+        if not self.previous_file.exists():
+            lines = [f"{key} {self.gsettings.get(TOUCHPAD, key)}\n" for key in TOUCHPAD_SETTINGS]
+            self.previous_file.write_text("".join(lines))
+        for key, value in TOUCHPAD_SETTINGS.items():
+            self.gsettings.set(TOUCHPAD, key, value)
+
+    def restore_touchpad_settings(self):
+        if not self.previous_file.exists():
+            return
+        for line in self.previous_file.read_text().splitlines():
+            key, _, value = line.partition(" ")
+            if key in TOUCHPAD_SETTINGS and value:
+                self.gsettings.set(TOUCHPAD, key, value)
+        self.previous_file.unlink()
+
+    def calibrate_scrolling(self):
+        """Writes scroll.conf for the scroll library; returns it, or None."""
+        if not os.path.exists(f"{LIBDIR}/libtrackpad-like-mac-scroll.so"):
+            return None
+        try:
+            px_per_mm = screen_px_per_mm(display_layout(), panel_width_mm)
+        except Exception as error:  # no session bus, no mutter, ...
+            print(f"Scrolling not calibrated: {error}", file=sys.stderr)
+            return None
+        if px_per_mm is None:
+            print("Scrolling not calibrated: unknown screen size", file=sys.stderr)
+            return None
+        config = f"px_per_mm={px_per_mm:.2f} slow={SLOW_RATIO} fast={FAST_RATIO}\n"
+        # Rewriting an unchanged file would still make the library re-read it.
+        if not self.scroll_file.exists() or self.scroll_file.read_text() != config:
+            self.dir.mkdir(parents=True, exist_ok=True)
+            tmp = self.scroll_file.with_suffix(".tmp")
+            tmp.write_text(config)
+            tmp.replace(self.scroll_file)
+        return config.strip()
+
+
+def display_layout():
+    """Returns [(connector, mode width px, scale, is builtin)] from mutter."""
+    import gi
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio
+
+    reply = Gio.bus_get_sync(Gio.BusType.SESSION).call_sync(
+        "org.gnome.Mutter.DisplayConfig", "/org/gnome/Mutter/DisplayConfig",
+        "org.gnome.Mutter.DisplayConfig", "GetCurrentState", None, None,
+        Gio.DBusCallFlags.NONE, 2000, None)
+    _, monitors, logical_monitors, _ = reply.unpack()
+    scales = {spec[0]: lm[2] for lm in logical_monitors for spec in lm[5]}
+    layout = []
+    for (connector, *_), modes, props in monitors:
+        current = [m for m in modes if m[6].get("is-current")]
+        if current and connector in scales:
+            layout.append((connector, current[0][1], scales[connector],
+                           props.get("is-builtin", False)))
+    return layout
+
+
+def panel_width_mm(connector):
+    """The panel's physical width from its EDID, or None."""
+    for edid in glob.glob(f"/sys/class/drm/card*-{connector}/edid"):
+        data = pathlib.Path(edid).read_bytes()
+        if len(data) >= 128:
+            timing = data[54:72]  # first detailed timing descriptor, in mm
+            width = timing[12] | ((timing[14] & 0xF0) << 4)
+            return width or data[21] * 10 or None
+    return None
+
+
+def screen_px_per_mm(layout, width_mm_of):
+    """Logical pixels per physical mm of the built-in screen (else the first)."""
+    ordered = sorted(layout, key=lambda monitor: not monitor[3])
+    for connector, width_px, scale, _ in ordered:
+        width_mm = width_mm_of(connector)
+        if width_mm:
+            return width_px / scale / width_mm
+    return None
+
+
+def status(user):
+    def line(label, ok, detail=""):
+        print(f"  {'✓' if ok else '✗'} {label}{': ' + detail if detail else ''}")
+
+    service = subprocess.run(["systemctl", "is-active", SERVICE],
+                             capture_output=True, text=True).stdout.strip()
+    line("Drag and gesture service", service == "active", service)
+    line("Gesture stream", os.path.exists(SOCKET), SOCKET)
+    try:
+        enabled = UUID in parse_strv(user.gsettings.get(SHELL, "enabled-extensions"))
+    except (OSError, subprocess.CalledProcessError, ValueError, SyntaxError):
+        enabled = False
+    line("GNOME extension enabled", enabled)
+    scroll = user.scroll_file.read_text().strip() if user.scroll_file.exists() else ""
+    line("Scrolling calibrated", bool(scroll), scroll)
+    line("Scroll library loaded in GNOME Shell", shell_has_scroll_library())
+    line("Setup state", user.state == "active", user.state or "not set up")
+
+
+def shell_has_scroll_library():
+    shells = subprocess.run(["pgrep", "-u", str(os.getuid()), "-x", "gnome-shell"],
+                            capture_output=True, text=True).stdout.split()
+    for pid in shells:
+        try:
+            if "libtrackpad-like-mac-scroll" in pathlib.Path(f"/proc/{pid}/maps").read_text():
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def uninstall(user, run=subprocess.run):
+    """Resets the user, then removes the package or the files `make install` listed."""
+    user.reset()
+    if run(["dpkg", "-s", "trackpad-like-mac"], capture_output=True).returncode == 0:
+        run(["sudo", "apt-get", "remove", "-y", "trackpad-like-mac"], check=True)
+        return
+    manifest = pathlib.Path(LIBDIR, "installed-files")
+    files = [f for f in manifest.read_text().split("\n") if f.startswith("/")]
+    run(["sudo", "systemctl", "disable", "--now", SERVICE])
+    run(["sudo", "rm", "-f", "--", *files], check=True)
+    # Remove the directories left empty, deepest first.
+    dirs = sorted({str(pathlib.Path(f).parent) for f in files}, key=len, reverse=True)
+    run(["sudo", "rmdir", "--ignore-fail-on-non-empty", "--", *dirs])
+    run(["sudo", "systemctl", "daemon-reload"])
+    run(["systemctl", "--user", "daemon-reload"])
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="trackpad-like-mac", description=__doc__.split("\n")[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+    setup = commands.add_parser("setup", help="turn everything on for this user")
+    setup.add_argument("--login", action="store_true", help=argparse.SUPPRESS)
+    commands.add_parser("reset", help="turn everything off and restore settings")
+    commands.add_parser("status", help="show what is active")
+    commands.add_parser("uninstall", help="reset, then remove trackpad-like-mac entirely")
+    args = parser.parse_args(argv)
+
+    if os.geteuid() == 0:
+        parser.error("run as your own user, not as root")
+    user = User()
+    if args.command == "setup":
+        user.setup(at_login=args.login)
+        if not args.login:
+            print("Done. Log out and back in once to activate the gestures and scrolling.")
+    elif args.command == "reset":
+        user.reset()
+        print("Done. Log out and back in to finish turning it off.")
+    elif args.command == "uninstall":
+        uninstall(user)
+        print("Removed. Log out and back in to finish.")
+    else:
+        status(user)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

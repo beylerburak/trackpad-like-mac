@@ -1,0 +1,8 @@
+{
+  "uuid": "trackpad-like-mac@beylerburak.github.io",
+  "name": "Trackpad Like Mac",
+  "description": "macOS-style touchpad gestures: four-finger workspace and overview swipes (leaving three fingers free for dragging), pinch for the app grid and desktop, and a right-edge swipe for notifications. Works with the trackpad-like-mac daemon.",
+  "url": "https://github.com/beylerburak/trackpad-like-mac",
+  "shell-version": ["45", "46", "47", "48"],
+  "version": 1
+}

@@ -1,0 +1,12 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -e
+
+if [ "$1" = remove ] || [ "$1" = purge ]; then
+    systemctl daemon-reload || true
+    for dir in /run/user/*; do
+        [ -d "$dir" ] || continue
+        user=$(stat -c %U "$dir")
+        systemctl --user --machine="$user@" daemon-reload 2>/dev/null || true
+    done
+fi

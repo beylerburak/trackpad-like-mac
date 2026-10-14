@@ -1,0 +1,8 @@
+/* Export only the wrapped libinput function, under libinput's own symbol
+ * version so mutter's versioned reference binds to it. */
+LIBINPUT_1.19 {
+	global:
+		libinput_event_pointer_get_scroll_value;
+	local:
+		*;
+};

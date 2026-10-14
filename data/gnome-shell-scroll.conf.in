@@ -1,0 +1,6 @@
+# trackpad-like-mac: Mac-like two-finger scrolling.
+# Loads a small library into GNOME Shell (Wayland session only) that rescales
+# touchpad scrolling. It does nothing for users without
+# ~/.config/trackpad-like-mac/scroll.conf (see `trackpad-like-mac setup`).
+[Service]
+Environment=LD_PRELOAD=@LIBDIR@/libtrackpad-like-mac-scroll.so

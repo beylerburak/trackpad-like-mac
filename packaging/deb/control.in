@@ -1,0 +1,16 @@
+Package: trackpad-like-mac
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCH@
+Installed-Size: @SIZE@
+Depends: python3 (>= 3.9), systemd
+Recommends: gnome-shell (>= 45), python3-gi
+Maintainer: Burak Beyler <burakbeyler@icloud.com>
+Homepage: https://github.com/beylerburak/trackpad-like-mac
+Description: macOS-style touchpad gestures for Linux
+ Makes a Linux touchpad behave like a MacBook trackpad: three-finger drag,
+ four-finger swipes for workspaces and the overview, thumb-and-three-finger
+ pinches for the app grid and desktop, a right-edge swipe for notifications
+ and scrolling that follows the fingers. Gestures beyond dragging need
+ GNOME Shell 45 or later.

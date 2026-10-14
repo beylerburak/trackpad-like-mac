@@ -1,0 +1,15 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -e
+
+if [ "$1" = remove ]; then
+    # Restore the touchpad settings of users who are logged in; others can
+    # run `trackpad-like-mac reset` themselves before removing the package.
+    for dir in /run/user/*; do
+        [ -S "$dir/bus" ] || continue
+        user=$(stat -c %U "$dir")
+        runuser -u "$user" -- env DBUS_SESSION_BUS_ADDRESS="unix:path=$dir/bus" \
+            XDG_RUNTIME_DIR="$dir" trackpad-like-mac reset >/dev/null 2>&1 || true
+    done
+    systemctl disable --now trackpad-like-mac.service || true
+fi

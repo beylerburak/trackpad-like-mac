@@ -1,0 +1,655 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""macOS-style three-finger drag for Linux touchpads.
+
+Touchpads are read passively (never grabbed), so the desktop keeps full
+control of them and nothing breaks if this daemon stops. While three fingers
+rest on the pad and move, a virtual uinput mouse holds the left button and
+follows the fingers.
+
+It also tracks thumb-and-three-finger pinches (Launchpad / show desktop) and
+two-finger swipes in from the right edge (Notification Center) on the raw
+touches, and streams them over a Unix socket that the GNOME extension
+follows, so its animations move with the fingers. libinput can't be
+relied on for these: it often treats the thumb as resting and reports a
+pinch-in as a three-finger swipe.
+
+Standard library only: needs Python 3 and Linux.
+"""
+
+import configparser
+import fcntl
+import glob
+import logging
+import math
+import os
+import select
+import signal
+import socket
+import struct
+import sys
+import time
+from collections import namedtuple
+
+log = logging.getLogger("trackpad-like-mac")
+
+CONFIG_PATH = "/etc/trackpad-like-mac.conf"
+DEFAULTS = {
+    "speed": 1.0,               # multiplier on the drag pointer speed
+    "release_delay_ms": 250,    # grace period to re-place fingers, as on macOS
+    "start_threshold_mm": 1.0,  # movement needed before the button goes down
+}
+# libinput scales touchpads to ~1000 dpi and slows them by ~0.3, so ~12
+# pointer units per mm keeps drags close to normal one-finger pointer speed.
+UNITS_PER_MM = 12.0
+RESCAN_INTERVAL = 2.0
+# After a drag, one or two fingers left on the pad are either fingers lifting
+# (or landing) one by one, which takes a few ms, or one finger pointing on,
+# which must end the drag at once or it would keep dragging.
+PARTIAL_GRACE = 0.08
+PARTIAL_MOVE_MM = 0.5
+# A pinch starts once the touches' spread changes this much (as a ratio),
+# unless the fingers first travel PINCH_SWIPE_GUARD_MM together (a swipe).
+PINCH_START = 0.1
+PINCH_SWIPE_GUARD_MM = 6.0
+# Two-finger swipes: starting this close to the right edge, then travelling
+# this far, mostly horizontally.
+EDGE_ZONE_MM = 10.0
+EDGE_SWIPE_MM = 12.0
+# Only root can create files here (systemd RuntimeDirectory), so clients can
+# trust what they read from the socket.
+GESTURE_SOCKET = "/run/trackpad-like-mac/gestures.sock"
+
+# Linux input ABI: linux/input.h, linux/input-event-codes.h, linux/uinput.h
+EV_SYN, EV_KEY, EV_REL, EV_ABS = 0x00, 0x01, 0x02, 0x03
+SYN_REPORT, SYN_DROPPED = 0, 3
+REL_X, REL_Y = 0x00, 0x01
+BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
+BTN_TOOL_FINGER, BTN_TOOL_QUINTTAP = 0x145, 0x148
+BTN_TOOL_DOUBLETAP, BTN_TOOL_TRIPLETAP, BTN_TOOL_QUADTAP = 0x14D, 0x14E, 0x14F
+ABS_MT_SLOT = 0x2F
+ABS_MT_POSITION_X, ABS_MT_POSITION_Y = 0x35, 0x36
+ABS_MT_TRACKING_ID = 0x39
+INPUT_PROP_POINTER, INPUT_PROP_DIRECT = 0x00, 0x01
+KEY_MAX, ABS_MAX, INPUT_PROP_MAX = 0x2FF, 0x3F, 0x1F
+BUS_VIRTUAL = 0x06
+
+FINGER_TOOLS = {
+    BTN_TOOL_FINGER: 1,
+    BTN_TOOL_DOUBLETAP: 2,
+    BTN_TOOL_TRIPLETAP: 3,
+    BTN_TOOL_QUADTAP: 4,
+    BTN_TOOL_QUINTTAP: 5,
+}
+
+EVENT = struct.Struct("llHHi")
+ABSINFO = struct.Struct("6i")  # value, minimum, maximum, fuzz, flat, resolution
+UINPUT_SETUP = struct.Struct("HHHH80sI")
+
+# fingers: count from the kernel's BTN_TOOL_* keys; dx, dy: mean motion in
+# device units; touches: tracking id -> (x, y) in device units.
+Frame = namedtuple("Frame", "fingers dx dy touches")
+
+
+def _ioc(direction, kind, nr, size):
+    return (direction << 30) | (size << 16) | (ord(kind) << 8) | nr
+
+
+_NONE, _WRITE, _READ = 0, 1, 2
+
+
+def EVIOCGBIT(ev, length):
+    return _ioc(_READ, "E", 0x20 + ev, length)
+
+
+def EVIOCGABS(axis):
+    return _ioc(_READ, "E", 0x40 + axis, ABSINFO.size)
+
+
+def EVIOCGKEY(length):
+    return _ioc(_READ, "E", 0x18, length)
+
+
+def EVIOCGPROP(length):
+    return _ioc(_READ, "E", 0x09, length)
+
+
+def EVIOCGNAME(length):
+    return _ioc(_READ, "E", 0x06, length)
+
+
+UI_SET_EVBIT = _ioc(_WRITE, "U", 100, 4)
+UI_SET_KEYBIT = _ioc(_WRITE, "U", 101, 4)
+UI_SET_RELBIT = _ioc(_WRITE, "U", 102, 4)
+UI_DEV_SETUP = _ioc(_WRITE, "U", 3, UINPUT_SETUP.size)
+UI_DEV_CREATE = _ioc(_NONE, "U", 1, 0)
+UI_DEV_DESTROY = _ioc(_NONE, "U", 2, 0)
+
+
+def _query_bits(fd, request, max_bit):
+    buf = bytearray(max_bit // 8 + 1)
+    fcntl.ioctl(fd, request(len(buf)), buf)
+    return buf
+
+
+def _has_bit(buf, bit):
+    return bool(buf[bit // 8] >> (bit % 8) & 1)
+
+
+def _absinfo(fd, axis):
+    buf = bytearray(ABSINFO.size)
+    fcntl.ioctl(fd, EVIOCGABS(axis), buf)
+    return ABSINFO.unpack(buf)
+
+
+class VirtualMouse:
+    """A uinput mouse that only ever sends left-button drags."""
+
+    def __init__(self):
+        self.fd = os.open("/dev/uinput", os.O_WRONLY | os.O_NONBLOCK)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_KEY)
+        fcntl.ioctl(self.fd, UI_SET_EVBIT, EV_REL)
+        # Right/middle are never sent, but libinput expects them on a mouse.
+        for button in (BTN_LEFT, BTN_RIGHT, BTN_MIDDLE):
+            fcntl.ioctl(self.fd, UI_SET_KEYBIT, button)
+        for axis in (REL_X, REL_Y):
+            fcntl.ioctl(self.fd, UI_SET_RELBIT, axis)
+        setup = UINPUT_SETUP.pack(
+            BUS_VIRTUAL, 0, 0, 1, b"trackpad-like-mac three-finger drag", 0)
+        fcntl.ioctl(self.fd, UI_DEV_SETUP, setup)
+        fcntl.ioctl(self.fd, UI_DEV_CREATE)
+        self.pressed = False
+
+    def _emit(self, *events):
+        data = b"".join(EVENT.pack(0, 0, t, c, v) for t, c, v in events)
+        os.write(self.fd, data + EVENT.pack(0, 0, EV_SYN, SYN_REPORT, 0))
+
+    def press(self):
+        if not self.pressed:
+            self._emit((EV_KEY, BTN_LEFT, 1))
+            self.pressed = True
+
+    def release(self):
+        if self.pressed:
+            self._emit((EV_KEY, BTN_LEFT, 0))
+            self.pressed = False
+
+    def move(self, dx, dy):
+        events = []
+        if dx:
+            events.append((EV_REL, REL_X, dx))
+        if dy:
+            events.append((EV_REL, REL_Y, dy))
+        if events:
+            self._emit(*events)
+
+    def close(self):
+        self.release()
+        fcntl.ioctl(self.fd, UI_DEV_DESTROY)
+        os.close(self.fd)
+
+
+class FrameDecoder:
+    """Turns raw multitouch events into per-frame finger count and motion.
+
+    Motion is the mean movement of fingers present in both the previous and
+    the current frame, so fingers landing or lifting never cause jumps.
+    """
+
+    def __init__(self, fingers=0, slot=0):
+        self.fingers = fingers
+        self.slot = slot
+        self.slots = {}  # slot -> [tracking_id, x, y]
+        self.previous = {}
+        self.dropped = False
+
+    def resync(self, fingers, slot):
+        self.fingers, self.slot = fingers, slot
+        self.previous = {}
+        self.dropped = False
+
+    def feed(self, etype, code, value):
+        """Returns a Frame at the end of each frame, else None."""
+        if etype == EV_SYN:
+            if code == SYN_DROPPED:
+                self.dropped = True
+            elif code == SYN_REPORT and not self.dropped:
+                return self._end_frame()
+            return None
+        if self.dropped:
+            return None
+        if etype == EV_KEY and code in FINGER_TOOLS:
+            if value:
+                self.fingers = FINGER_TOOLS[code]
+            elif self.fingers == FINGER_TOOLS[code]:
+                self.fingers = 0
+        elif etype == EV_ABS:
+            if code == ABS_MT_SLOT:
+                self.slot = value
+            elif code == ABS_MT_TRACKING_ID:
+                self.slots[self.slot] = [value, None, None]
+            elif code in (ABS_MT_POSITION_X, ABS_MT_POSITION_Y):
+                touch = self.slots.setdefault(self.slot, [None, None, None])
+                touch[1 if code == ABS_MT_POSITION_X else 2] = value
+        return None
+
+    def _end_frame(self):
+        current = {
+            slot: tuple(touch) for slot, touch in self.slots.items()
+            if touch[0] != -1 and touch[1] is not None and touch[2] is not None
+        }
+        moves = [
+            (touch[1] - self.previous[slot][1], touch[2] - self.previous[slot][2])
+            for slot, touch in current.items()
+            if slot in self.previous and self.previous[slot][0] == touch[0]
+        ]
+        self.previous = current
+        touches = {touch[0]: (touch[1], touch[2]) for touch in current.values()}
+        if not moves:
+            return Frame(self.fingers, 0.0, 0.0, touches)
+        return Frame(self.fingers,
+                     sum(m[0] for m in moves) / len(moves),
+                     sum(m[1] for m in moves) / len(moves),
+                     touches)
+
+
+class DragEngine:
+    """The three-finger drag state machine for one touchpad."""
+
+    IDLE, ARMED, DRAGGING, LINGER = "idle", "armed", "dragging", "linger"
+
+    def __init__(self, mouse, speed=1.0, release_delay=0.25, threshold_mm=1.0):
+        self.mouse = mouse
+        self.scale = UNITS_PER_MM * speed
+        self.release_delay = release_delay
+        self.threshold_mm = threshold_mm
+        self.state = self.IDLE
+        self.travel = 0.0
+        self.linger_until = None
+        # Fingers lifting off after a 4-finger swipe pass through 3; that
+        # must not start a drag, so arming waits until fewer than 3 remain.
+        self.blocked = False
+        self.remainder = [0.0, 0.0]
+        self.partial_since = None
+        self.partial_travel = 0.0
+
+    def frame(self, fingers, dx_mm, dy_mm, now):
+        if fingers >= 4:
+            self.blocked = True
+        elif fingers < 3:
+            self.blocked = False
+
+        if fingers == 3:
+            if self.state == self.IDLE and not self.blocked:
+                self.state, self.travel = self.ARMED, 0.0
+            elif self.state == self.ARMED:
+                self.travel += math.hypot(dx_mm, dy_mm)
+                if self.travel >= self.threshold_mm:
+                    self.mouse.press()
+                    self.state = self.DRAGGING
+            elif self.state in (self.DRAGGING, self.LINGER):
+                self.state, self.partial_since = self.DRAGGING, None
+                self._move(dx_mm, dy_mm)
+            return
+
+        if self.state == self.ARMED:
+            self.state = self.IDLE
+        elif self.state not in (self.DRAGGING, self.LINGER):
+            return
+        elif fingers >= 4:
+            self._release()
+        elif fingers == 0:
+            # All fingers up: hold the drag briefly so three fingers can be
+            # re-placed to continue it, as on macOS.
+            if self.state == self.DRAGGING or self.partial_since is not None:
+                self.linger_until = now + self.release_delay
+            self.state, self.partial_since = self.LINGER, None
+        else:
+            if self.partial_since is None:
+                self.partial_since, self.partial_travel = now, 0.0
+                deadline = now + PARTIAL_GRACE
+                self.linger_until = (deadline if self.state == self.DRAGGING
+                                     else min(self.linger_until, deadline))
+            self.state = self.LINGER
+            self.partial_travel += math.hypot(dx_mm, dy_mm)
+            if self.partial_travel >= PARTIAL_MOVE_MM:
+                self._release()
+
+    def tick(self, now):
+        if self.state == self.LINGER and now >= self.linger_until:
+            self._release()
+
+    def deadline(self):
+        return self.linger_until if self.state == self.LINGER else None
+
+    def reset(self):
+        if self.state in (self.DRAGGING, self.LINGER):
+            self._release()
+        self.state = self.IDLE
+
+    def _release(self):
+        self.mouse.release()
+        self.state = self.IDLE
+        self.linger_until = None
+        self.remainder = [0.0, 0.0]
+        self.partial_since = None
+
+    def _move(self, dx_mm, dy_mm):
+        steps = []
+        for axis, delta in enumerate((dx_mm, dy_mm)):
+            self.remainder[axis] += delta * self.scale
+            step = int(self.remainder[axis])
+            self.remainder[axis] -= step
+            steps.append(step)
+        self.mouse.move(*steps)
+
+
+class PinchTracker:
+    """Follows pinches of four or more fingers (thumb and three fingers).
+
+    The measure is the touches' mean distance from their centroid, relative
+    to its value when the fingers landed. Reports "begin", then "update
+    <ratio>" every frame, then "end" once fewer than four fingers remain.
+    """
+
+    def __init__(self, emit):
+        self.emit = emit
+        self.ids = None
+        self.base_spread = 0.0
+        self.origin = None  # centroid when the fingers landed
+        self.ratio = 1.0
+        self.active = False
+        self.swipe = False
+
+    def frame(self, fingers, touches):
+        """touches: tracking id -> (x_mm, y_mm)."""
+        # Some touchpads track fewer slots than fingers they count, so three
+        # tracked touches are enough as long as four fingers are down.
+        if fingers < 4 or len(touches) < 3:
+            if self.active:
+                self.emit("end")
+            self.ids, self.active, self.swipe, self.ratio = None, False, False, 1.0
+            return
+
+        ids = frozenset(touches)
+        centroid, spread = self._measure(touches.values())
+        if ids != self.ids:
+            # A finger landed or lifted: re-base so the ratio carries on
+            # smoothly instead of jumping.
+            self.ids, self.origin = ids, centroid
+            self.base_spread = spread / self.ratio if self.active else spread
+            return
+        if self.swipe or self.base_spread <= 0:
+            return
+
+        self.ratio = spread / self.base_spread
+        if not self.active:
+            if math.dist(centroid, self.origin) >= PINCH_SWIPE_GUARD_MM:
+                self.swipe = True
+                return
+            if abs(self.ratio - 1) < PINCH_START:
+                return
+            self.active = True
+            self.emit("begin")
+        self.emit(f"update {self.ratio:.4f}")
+
+    @staticmethod
+    def _measure(points):
+        points = list(points)
+        cx = sum(p[0] for p in points) / len(points)
+        cy = sum(p[1] for p in points) / len(points)
+        spread = sum(math.hypot(p[0] - cx, p[1] - cy) for p in points) / len(points)
+        return (cx, cy), spread
+
+
+class EdgeSwipeDetector:
+    """Detects two-finger horizontal swipes, once per touch.
+
+    Reports "edge right" for a swipe in from the right edge of the pad
+    (Notification Center on macOS) and "swipe right" for any swipe to the
+    right (closing it). Ordinary scrolling never travels far enough sideways.
+    """
+
+    def __init__(self, emit, right_edge_mm):
+        self.emit = emit
+        self.right_edge_mm = right_edge_mm
+        self.ids = None
+        self.start = None
+        self.from_edge = False
+        self.done = False
+
+    def frame(self, fingers, touches):
+        """touches: tracking id -> (x_mm, y_mm)."""
+        if fingers != 2 or len(touches) != 2:
+            self.ids = None
+            return
+        ids = frozenset(touches)
+        cx = sum(p[0] for p in touches.values()) / 2
+        cy = sum(p[1] for p in touches.values()) / 2
+        if ids != self.ids:
+            self.ids, self.start, self.done = ids, (cx, cy), False
+            self.from_edge = cx >= self.right_edge_mm - EDGE_ZONE_MM
+            return
+        if self.done:
+            return
+        dx, dy = cx - self.start[0], cy - self.start[1]
+        if abs(dx) < EDGE_SWIPE_MM:
+            return
+        self.done = True
+        if abs(dy) > abs(dx) / 2:
+            return  # diagonal: a scroll, not a swipe
+        if dx < 0 and self.from_edge:
+            self.emit("edge right")
+        elif dx > 0:
+            self.emit("swipe right")
+
+
+class GestureServer:
+    """Broadcasts gesture lines to every client of a Unix stream socket."""
+
+    def __init__(self, path=GESTURE_SOCKET):
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.bind(path)
+        os.chmod(path, 0o666)  # connecting needs write permission
+        self.sock.listen()
+        self.sock.setblocking(False)
+        self.clients = []
+
+    def fds(self):
+        return [self.sock, *self.clients]
+
+    def handle(self, ready):
+        if self.sock in ready:
+            try:
+                client, _ = self.sock.accept()
+                client.setblocking(False)
+                self.clients.append(client)
+            except OSError:
+                pass
+        for client in [c for c in self.clients if c in ready]:
+            # Clients never send anything, so readable means closed.
+            try:
+                if client.recv(64):
+                    continue
+            except BlockingIOError:
+                continue
+            except OSError:
+                pass
+            self._drop(client)
+
+    def __call__(self, line):
+        data = (line + "\n").encode()
+        for client in list(self.clients):
+            try:
+                client.send(data)
+            except OSError:  # gone, or too slow to keep up
+                self._drop(client)
+
+    def _drop(self, client):
+        self.clients.remove(client)
+        client.close()
+
+    def close(self):
+        for client in self.clients:
+            client.close()
+        self.sock.close()
+
+
+class Touchpad:
+    def __init__(self, path, fd, name, engine, emit_gesture):
+        self.path, self.fd, self.name = path, fd, name
+        self.engine = engine
+        self.res_x, self.res_y = (self._units_per_mm(ABS_MT_POSITION_X),
+                                  self._units_per_mm(ABS_MT_POSITION_Y))
+        right_edge_mm = _absinfo(fd, ABS_MT_POSITION_X)[2] / self.res_x
+        self.gestures = [PinchTracker(emit_gesture),
+                         EdgeSwipeDetector(emit_gesture, right_edge_mm)]
+        self.slot_count = _absinfo(fd, ABS_MT_SLOT)[2] + 1
+        self.decoder = FrameDecoder()
+        self._resync()
+
+    def _units_per_mm(self, axis):
+        _, minimum, maximum, _, _, resolution = _absinfo(self.fd, axis)
+        # Without a reported resolution, assume a ~100 mm wide pad.
+        return resolution or max(maximum - minimum, 1) / 100.0
+
+    def _resync(self):
+        keys = _query_bits(self.fd, EVIOCGKEY, KEY_MAX)
+        fingers = max((n for code, n in FINGER_TOOLS.items() if _has_bit(keys, code)),
+                      default=0)
+        self.decoder.resync(fingers, _absinfo(self.fd, ABS_MT_SLOT)[0])
+
+    def read(self, now):
+        data = os.read(self.fd, EVENT.size * 64)
+        for offset in range(0, len(data) - EVENT.size + 1, EVENT.size):
+            _, _, etype, code, value = EVENT.unpack_from(data, offset)
+            if self.decoder.dropped and etype == EV_SYN and code == SYN_REPORT:
+                self._resync()
+                continue
+            frame = self.decoder.feed(etype, code, value)
+            if frame:
+                self.engine.frame(frame.fingers, frame.dx / self.res_x,
+                                  frame.dy / self.res_y, now)
+                touches = {tid: (x / self.res_x, y / self.res_y)
+                           for tid, (x, y) in frame.touches.items()}
+                for gesture in self.gestures:
+                    gesture.frame(frame.fingers, touches)
+
+    def close(self):
+        self.engine.reset()
+        os.close(self.fd)
+
+
+def open_touchpad(path):
+    """Returns (fd, name) if path is a multitouch touchpad, else None."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        props = _query_bits(fd, EVIOCGPROP, INPUT_PROP_MAX)
+        axes = _query_bits(fd, lambda n: EVIOCGBIT(EV_ABS, n), ABS_MAX)
+        keys = _query_bits(fd, lambda n: EVIOCGBIT(EV_KEY, n), KEY_MAX)
+        if (_has_bit(props, INPUT_PROP_POINTER)
+                and not _has_bit(props, INPUT_PROP_DIRECT)
+                and _has_bit(axes, ABS_MT_POSITION_X)
+                and _has_bit(axes, ABS_MT_TRACKING_ID)
+                and _has_bit(keys, BTN_TOOL_TRIPLETAP)):
+            name = bytearray(256)
+            fcntl.ioctl(fd, EVIOCGNAME(len(name)), name)
+            return fd, name.split(b"\0", 1)[0].decode(errors="replace")
+    except OSError:
+        pass
+    os.close(fd)
+    return None
+
+
+def load_config(path=CONFIG_PATH):
+    parser = configparser.ConfigParser()
+    parser.read(path)
+    section = parser["drag"] if parser.has_section("drag") else {}
+    config = {}
+    for key, default in DEFAULTS.items():
+        try:
+            config[key] = type(default)(section.get(key, default))
+        except ValueError:
+            log.warning("Ignoring invalid %s in %s", key, path)
+            config[key] = default
+    return config
+
+
+def run(config):
+    mouse = VirtualMouse()
+    gestures = GestureServer()
+    pads = {}
+    rejected = {}  # path -> device number, to skip known non-touchpads
+    next_scan = 0.0
+
+    def make_engine():
+        return DragEngine(mouse, speed=config["speed"],
+                          release_delay=config["release_delay_ms"] / 1000.0,
+                          threshold_mm=config["start_threshold_mm"])
+
+    try:
+        while True:
+            now = time.monotonic()
+            if now >= next_scan:
+                for path in sorted(glob.glob("/dev/input/event*")):
+                    if path in pads:
+                        continue
+                    try:
+                        rdev = os.stat(path).st_rdev
+                        if rejected.get(path) == rdev:
+                            continue
+                        found = open_touchpad(path)
+                    except OSError:
+                        continue
+                    if found is None:
+                        rejected[path] = rdev
+                        continue
+                    pads[path] = Touchpad(path, found[0], found[1], make_engine(),
+                                          gestures)
+                    log.info("Using touchpad %s (%s, %d touch slots)",
+                             found[1], path, pads[path].slot_count)
+                next_scan = now + RESCAN_INTERVAL
+
+            deadlines = [next_scan] + [d for d in (p.engine.deadline() for p in pads.values()) if d]
+            timeout = max(0.0, min(deadlines) - now)
+            ready, _, _ = select.select([p.fd for p in pads.values()] + gestures.fds(),
+                                        [], [], timeout)
+
+            now = time.monotonic()
+            gestures.handle(ready)
+            for pad in [p for p in pads.values() if p.fd in ready]:
+                try:
+                    pad.read(now)
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    log.info("Touchpad %s (%s) went away", pad.name, pad.path)
+                    pad.close()
+                    del pads[pad.path]
+            for pad in pads.values():
+                pad.engine.tick(now)
+    finally:
+        for pad in pads.values():
+            pad.close()
+        mouse.close()
+        gestures.close()
+
+
+def main():
+    logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    config = load_config()
+    log.info("Three-finger drag running (speed %.2f, release delay %d ms)",
+             config["speed"], config["release_delay_ms"])
+    try:
+        run(config)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

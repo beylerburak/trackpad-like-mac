@@ -1,0 +1,18 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -e
+
+if [ "$1" = configure ]; then
+    modprobe uinput 2>/dev/null || true
+    systemctl daemon-reload || true
+    systemctl enable trackpad-like-mac.service || true
+    systemctl restart trackpad-like-mac.service || true
+    # Let running user managers see the GNOME Shell drop-in, so the next
+    # login picks up the scrolling library.
+    for dir in /run/user/*; do
+        [ -d "$dir" ] || continue
+        user=$(stat -c %U "$dir")
+        systemctl --user --machine="$user@" daemon-reload 2>/dev/null || true
+    done
+    echo "trackpad-like-mac: log out and back in to activate the gestures."
+fi

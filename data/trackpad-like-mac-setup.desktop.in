@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Trackpad Like Mac setup
+Comment=Applies macOS-style touchpad settings for this user on first login
+Exec=@BINDIR@/trackpad-like-mac setup --login
+OnlyShowIn=GNOME;
+NoDisplay=true
